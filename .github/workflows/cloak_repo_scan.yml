@@ -1,0 +1,165 @@
+name: Cloak Repo Scan
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: "0 4 * * *"
+
+jobs:
+  cloak-scan:
+    name: Cloak Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build repository archive
+        run: git archive HEAD --format=zip -o repo.zip
+
+      - name: Compute changed paths for PRs
+        id: changed
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --name-only \
+              "${{ github.event.pull_request.base.sha }}" \
+              "${{ github.sha }}" \
+              | jq -R . | jq -s -c . > changed_paths.json
+            echo "Changed files: $(cat changed_paths.json)"
+          else
+            echo "[]" > changed_paths.json
+          fi
+
+      - name: Submit Cloak scan
+        id: submit
+        env:
+          CLOAK_BASE_URL: ${{ secrets.CLOAK_BASE_URL }}
+          CLOAK_API_TOKEN: ${{ secrets.CLOAK_API_TOKEN }}
+        shell: bash
+        run: |
+          EVENT_NAME="${{ github.event_name }}"
+          TRIGGER_SOURCE="push"
+          SCAN_MODE="full_scan"
+          PR_NUMBER=""
+          BASE_SHA=""
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            TRIGGER_SOURCE="pull_request"
+            SCAN_MODE="changed_files"
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          elif [ "$EVENT_NAME" = "schedule" ]; then
+            TRIGGER_SOURCE="schedule"
+            SCAN_MODE="scheduled_scan"
+          fi
+
+          CHANGED_PATHS_JSON="$(cat changed_paths.json)"
+
+          RESPONSE=$(curl -sS -X POST "${CLOAK_BASE_URL}/integrations/repo-scans" \
+            -H "Authorization: Bearer ${CLOAK_API_TOKEN}" \
+            -F "file=@repo.zip" \
+            -F "repo_full_name=${{ github.repository }}" \
+            -F "repo_url=${{ github.server_url }}/${{ github.repository }}" \
+            -F "repo_external_id=${{ github.repository_id }}" \
+            -F "vcs_provider=github" \
+            -F "branch_name=${{ github.ref_name }}" \
+            -F "commit_sha=${{ github.sha }}" \
+            -F "ref_name=${{ github.ref }}" \
+            -F "trigger_source=${TRIGGER_SOURCE}" \
+            -F "scan_mode=${SCAN_MODE}" \
+            -F "pull_request_number=${PR_NUMBER}" \
+            -F "base_commit_sha=${BASE_SHA}" \
+            -F "changed_paths=${CHANGED_PATHS_JSON}")
+
+          echo "Response: ${RESPONSE}"
+
+          RUN_ID=$(echo "${RESPONSE}" | jq -r '.data.run_id // empty')
+          if [ -z "${RUN_ID}" ]; then
+            echo "ERROR: No run_id returned."
+            exit 1
+          fi
+
+          echo "run_id=${RUN_ID}" >> $GITHUB_OUTPUT
+          echo "Scan submitted. run_id=${RUN_ID}"
+
+      - name: Wait for scan to complete
+        id: wait
+        env:
+          CLOAK_BASE_URL: ${{ secrets.CLOAK_BASE_URL }}
+          CLOAK_API_TOKEN: ${{ secrets.CLOAK_API_TOKEN }}
+        shell: bash
+        run: |
+          RUN_ID="${{ steps.submit.outputs.run_id }}"
+          MAX_WAIT=900
+          ELAPSED=0
+          INTERVAL=15
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS_RESPONSE=$(curl -sS \
+              -H "Authorization: Bearer ${CLOAK_API_TOKEN}" \
+              "${CLOAK_BASE_URL}/scans/${RUN_ID}")
+
+            STATUS=$(echo "${STATUS_RESPONSE}" | jq -r '.data.status // "unknown"')
+            echo "[${ELAPSED}s] status=${STATUS}"
+
+            case "$STATUS" in
+              completed|completed_with_errors|failed)
+                echo "scan_status=${STATUS}" >> $GITHUB_OUTPUT
+                break
+                ;;
+            esac
+
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "ERROR: Scan timed out."
+            exit 1
+          fi
+
+          if [ "$STATUS" = "failed" ]; then
+            echo "ERROR: Scan failed on Cloak side."
+            exit 1
+          fi
+
+      - name: Read Cloak CI decision
+        id: decision
+        env:
+          CLOAK_BASE_URL: ${{ secrets.CLOAK_BASE_URL }}
+          CLOAK_API_TOKEN: ${{ secrets.CLOAK_API_TOKEN }}
+          CLOAK_BLOCK_ON_FAIL: ${{ secrets.CLOAK_BLOCK_ON_FAIL }}
+        shell: bash
+        run: |
+          RUN_ID="${{ steps.submit.outputs.run_id }}"
+
+          CI_RESPONSE=$(curl -sS \
+            -H "Authorization: Bearer ${CLOAK_API_TOKEN}" \
+            "${CLOAK_BASE_URL}/scans/${RUN_ID}/ci.json")
+
+          DECISION=$(echo "${CI_RESPONSE}" | jq -r '.data.run_outcome.decision // "unknown"')
+          OUTCOME=$(echo "${CI_RESPONSE}" | jq -r '.data.run_outcome.outcome // "unknown"')
+          BLOCKING_REASONS=$(echo "${CI_RESPONSE}" | jq -r '.data.run_outcome.blocking_reasons // [] | join(", ")')
+          WARNING_REASONS=$(echo "${CI_RESPONSE}" | jq -r '.data.run_outcome.warning_reasons // [] | join(", ")')
+
+          echo "Decision=${DECISION}"
+          echo "Outcome=${OUTCOME}"
+          [ -n "${BLOCKING_REASONS}" ] && echo "Blocking=${BLOCKING_REASONS}"
+          [ -n "${WARNING_REASONS}" ] && echo "Warnings=${WARNING_REASONS}"
+
+          if [ "$DECISION" = "block" ]; then
+            echo "::error::Cloak blocked this scan. Blocking reasons: ${BLOCKING_REASONS}"
+            if [ "${CLOAK_BLOCK_ON_FAIL}" = "true" ]; then
+              exit 1
+            fi
+          elif [ "$DECISION" = "warn" ]; then
+            echo "::warning::Cloak warnings: ${WARNING_REASONS}"
+          else
+            echo "Cloak scan passed."
+          fi
