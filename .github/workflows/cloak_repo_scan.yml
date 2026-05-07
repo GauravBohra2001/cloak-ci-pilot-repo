@@ -36,6 +36,26 @@ jobs:
             echo "[]" > changed_paths.json
           fi
 
+      - name: Validate Cloak base URL
+        shell: bash
+        env:
+          CLOAK_BASE_URL: ${{ secrets.CLOAK_BASE_URL }}
+        run: |
+          echo "CLOAK_BASE_URL length: ${#CLOAK_BASE_URL}"
+          if [ "$CLOAK_BASE_URL" = "https://api.getcloakai.com" ]; then
+            echo "CLOAK_BASE_URL matches expected value"
+          else
+            echo "CLOAK_BASE_URL does NOT match expected value"
+            exit 1
+          fi
+
+      - name: Probe Cloak health endpoint
+        shell: bash
+        env:
+          CLOAK_BASE_URL: ${{ secrets.CLOAK_BASE_URL }}
+        run: |
+          curl -I -sS "${CLOAK_BASE_URL}/health"
+
       - name: Submit Cloak scan
         id: submit
         env:
