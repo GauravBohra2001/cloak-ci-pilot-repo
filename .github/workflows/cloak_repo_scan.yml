@@ -101,7 +101,14 @@ jobs:
 
           RUN_ID=$(echo "${RESPONSE}" | jq -r '.data.run_id // empty')
           if [ -z "${RUN_ID}" ]; then
-            echo "ERROR: No run_id returned."
+            ERROR_CODE=$(echo "${RESPONSE}" | jq -r '.error.code // empty')
+            ERROR_MSG=$(echo "${RESPONSE}"  | jq -r '.error.message // empty')
+            if [ "${ERROR_CODE}" = "rate_limited" ]; then
+              echo "::error::Cloak rate limit reached. ${ERROR_MSG}"
+            else
+              echo "::error::Scan submission failed. ${ERROR_MSG}"
+            fi
+            echo "Full response: ${RESPONSE}"
             exit 1
           fi
 
