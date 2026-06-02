@@ -195,7 +195,7 @@ jobs:
             echo "  Compliance posture: ${NOT_READY} Must Fix · ${AT_RISK} Needs Attention · ${READY} Audit Ready"
           fi
           echo ""
-          echo "  Dashboard: https://app.getcloakai.com/scans/${RUN_ID}"
+          echo "  Dashboard: https://app.getcloakai.com/scan/${RUN_ID}"
           echo "════════════════════════════════════════════"
           echo ""
 
@@ -203,7 +203,7 @@ jobs:
           echo "outcome=${OUTCOME}"   >> $GITHUB_OUTPUT
 
           if [ "$DECISION" = "block" ]; then
-            echo "::error::Cloak blocked this scan. ${BLOCKING_REASONS}. Dashboard: https://app.getcloakai.com/scans/${RUN_ID}"
+            echo "::error::Cloak blocked this scan. ${BLOCKING_REASONS}. Dashboard: https://app.getcloakai.com/scan/${RUN_ID}"
             if [ "${CLOAK_BLOCK_ON_FAIL}" = "true" ]; then
               exit 1
             else
