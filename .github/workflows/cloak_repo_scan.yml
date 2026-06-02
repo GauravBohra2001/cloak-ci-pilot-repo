@@ -8,6 +8,9 @@ on:
   schedule:
     - cron: "0 4 * * *"
 
+permissions:
+  contents: read
+
 jobs:
   cloak-scan:
     name: Cloak Security Scan
@@ -35,26 +38,6 @@ jobs:
           else
             echo "[]" > changed_paths.json
           fi
-
-      - name: Validate Cloak base URL
-        shell: bash
-        env:
-          CLOAK_BASE_URL: ${{ secrets.CLOAK_BASE_URL }}
-        run: |
-          echo "CLOAK_BASE_URL length: ${#CLOAK_BASE_URL}"
-          if [ "$CLOAK_BASE_URL" = "https://api.getcloakai.com" ]; then
-            echo "CLOAK_BASE_URL matches expected value"
-          else
-            echo "CLOAK_BASE_URL does NOT match expected value"
-            exit 1
-          fi
-
-      - name: Probe Cloak health endpoint
-        shell: bash
-        env:
-          CLOAK_BASE_URL: ${{ secrets.CLOAK_BASE_URL }}
-        run: |
-          curl -I -sS "${CLOAK_BASE_URL}/health"
 
       - name: Submit Cloak scan
         id: submit
@@ -113,9 +96,17 @@ jobs:
           fi
 
           echo "run_id=${RUN_ID}" >> $GITHUB_OUTPUT
-          echo "Scan submitted. run_id=${RUN_ID}"
+          echo "Scan submitted: run_id=${RUN_ID}"
 
-      - name: Wait for scan to complete
+      # Waits for TWO phases to complete:
+      #   Phase 1 - Scanner (semgrep + LLM enrichment): ~3-5 min
+      #             status becomes "completed" when done
+      #   Phase 2 - Compliance Intelligence Agent: ~90-180 sec after scan
+      #             compliance_assessed_at is set when done
+      #
+      # Both must complete before we read the CI decision, so the dashboard
+      # is fully populated when the developer clicks through.
+      - name: Wait for scan and compliance analysis to complete
         id: wait
         env:
           CLOAK_BASE_URL: ${{ secrets.CLOAK_BASE_URL }}
@@ -127,18 +118,34 @@ jobs:
           ELAPSED=0
           INTERVAL=15
 
+          echo "Waiting for Cloak scanner and compliance agent (timeout: ${MAX_WAIT}s)..."
+
           while [ $ELAPSED -lt $MAX_WAIT ]; do
-            STATUS_RESPONSE=$(curl -sS \
+            RESP=$(curl -sS \
               -H "Authorization: Bearer ${CLOAK_API_TOKEN}" \
               "${CLOAK_BASE_URL}/scans/${RUN_ID}")
 
-            STATUS=$(echo "${STATUS_RESPONSE}" | jq -r '.data.status // "unknown"')
-            echo "[${ELAPSED}s] status=${STATUS}"
+            STATUS=$(echo "${RESP}" | jq -r '.data.status // "unknown"')
+            AGENT_DONE=$(echo "${RESP}" | jq -r '.data.compliance_assessed_at // empty')
+
+            AGENT_LABEL="waiting"
+            [ -n "${AGENT_DONE}" ] && AGENT_LABEL="done"
+            echo "[${ELAPSED}s] scan=${STATUS} agent=${AGENT_LABEL}"
 
             case "$STATUS" in
-              completed|completed_with_errors|failed)
+              failed)
+                echo "::error::Cloak scan failed."
                 echo "scan_status=${STATUS}" >> $GITHUB_OUTPUT
-                break
+                exit 1
+                ;;
+              completed|completed_with_errors)
+                if [ -n "${AGENT_DONE}" ]; then
+                  echo "Scanner and compliance agent both complete."
+                  echo "scan_status=${STATUS}" >> $GITHUB_OUTPUT
+                  break
+                else
+                  echo "Scanner done. Waiting for compliance agent..."
+                fi
                 ;;
             esac
 
@@ -147,16 +154,11 @@ jobs:
           done
 
           if [ $ELAPSED -ge $MAX_WAIT ]; then
-            echo "ERROR: Scan timed out."
+            echo "::error::Timed out after ${MAX_WAIT}s."
             exit 1
           fi
 
-          if [ "$STATUS" = "failed" ]; then
-            echo "ERROR: Scan failed on Cloak side."
-            exit 1
-          fi
-
-      - name: Read Cloak CI decision
+      - name: Read compliance decision
         id: decision
         env:
           CLOAK_BASE_URL: ${{ secrets.CLOAK_BASE_URL }}
@@ -171,19 +173,41 @@ jobs:
             "${CLOAK_BASE_URL}/scans/${RUN_ID}/ci.json")
 
           DECISION=$(echo "${CI_RESPONSE}" | jq -r '.data.run_outcome.decision // "unknown"')
-          OUTCOME=$(echo "${CI_RESPONSE}" | jq -r '.data.run_outcome.outcome // "unknown"')
+          OUTCOME=$(echo "${CI_RESPONSE}"  | jq -r '.data.run_outcome.outcome  // "unknown"')
           BLOCKING_REASONS=$(echo "${CI_RESPONSE}" | jq -r '.data.run_outcome.blocking_reasons // [] | join(", ")')
-          WARNING_REASONS=$(echo "${CI_RESPONSE}" | jq -r '.data.run_outcome.warning_reasons // [] | join(", ")')
+          WARNING_REASONS=$(echo "${CI_RESPONSE}"  | jq -r '.data.run_outcome.warning_reasons  // [] | join(", ")')
 
-          echo "Decision=${DECISION}"
-          echo "Outcome=${OUTCOME}"
-          [ -n "${BLOCKING_REASONS}" ] && echo "Blocking=${BLOCKING_REASONS}"
-          [ -n "${WARNING_REASONS}" ] && echo "Warnings=${WARNING_REASONS}"
+          NOT_READY=$(echo "${CI_RESPONSE}" | jq -r '.data.audit_readiness_summary.verdict_counts.not_ready // 0')
+          AT_RISK=$(echo "${CI_RESPONSE}"   | jq -r '.data.audit_readiness_summary.verdict_counts.at_risk // 0')
+          READY=$(echo "${CI_RESPONSE}"     | jq -r '.data.audit_readiness_summary.verdict_counts.audit_ready // 0')
+          AGENT_AVAILABLE=$(echo "${CI_RESPONSE}" | jq -r '.data.audit_readiness_summary.available // false')
+
+          echo ""
+          echo "════════════════════════════════════════════"
+          echo "  Cloak Compliance Scan Result"
+          echo ""
+          echo "  Scanner decision  : ${DECISION}"
+          echo "  Outcome           : ${OUTCOME}"
+          [ -n "${BLOCKING_REASONS}" ] && echo "  Blocking          : ${BLOCKING_REASONS}"
+          [ -n "${WARNING_REASONS}"  ] && echo "  Warnings          : ${WARNING_REASONS}"
+          echo ""
+          if [ "${AGENT_AVAILABLE}" = "true" ]; then
+            echo "  Compliance posture: ${NOT_READY} Must Fix · ${AT_RISK} Needs Attention · ${READY} Audit Ready"
+          fi
+          echo ""
+          echo "  Dashboard: https://app.getcloakai.com/scans/${RUN_ID}"
+          echo "════════════════════════════════════════════"
+          echo ""
+
+          echo "decision=${DECISION}" >> $GITHUB_OUTPUT
+          echo "outcome=${OUTCOME}"   >> $GITHUB_OUTPUT
 
           if [ "$DECISION" = "block" ]; then
-            echo "::error::Cloak blocked this scan. Blocking reasons: ${BLOCKING_REASONS}"
+            echo "::error::Cloak blocked this scan. ${BLOCKING_REASONS}. Dashboard: https://app.getcloakai.com/scans/${RUN_ID}"
             if [ "${CLOAK_BLOCK_ON_FAIL}" = "true" ]; then
               exit 1
+            else
+              echo "Set CLOAK_BLOCK_ON_FAIL=true to enforce blocking."
             fi
           elif [ "$DECISION" = "warn" ]; then
             echo "::warning::Cloak warnings: ${WARNING_REASONS}"
