@@ -181,6 +181,9 @@ jobs:
           AT_RISK=$(echo "${CI_RESPONSE}"   | jq -r '.data.audit_readiness_summary.verdict_counts.at_risk // 0')
           READY=$(echo "${CI_RESPONSE}"     | jq -r '.data.audit_readiness_summary.verdict_counts.audit_ready // 0')
           AGENT_AVAILABLE=$(echo "${CI_RESPONSE}" | jq -r '.data.audit_readiness_summary.available // false')
+          AGENT_METHOD=$(echo "${CI_RESPONSE}" | jq -r '.data.audit_readiness_summary.method // empty')
+          AGENT_CONTROLS=$(echo "${CI_RESPONSE}" | jq -r '.data.audit_readiness_summary.controls | length // 0')
+          echo "[debug] agent available=${AGENT_AVAILABLE} method=${AGENT_METHOD} controls=${AGENT_CONTROLS}"
 
           echo ""
           echo "════════════════════════════════════════════"
