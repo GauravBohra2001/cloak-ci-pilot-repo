@@ -186,21 +186,28 @@ jobs:
           # Extract conflict control names from the warning that starts with "agent_found_issues_scanner_missed:"
           CONFLICT_CONTROLS=$(echo "${WARNING_REASONS}" | grep -o 'agent_found_issues_scanner_missed:[^,]*' | sed 's/agent_found_issues_scanner_missed://' || true)
 
+          # Map internal decision value to a developer-friendly label
+          if [ "${DECISION}" = "block" ]; then
+            DISPLAY_DECISION="Flagged"
+          elif [ "${DECISION}" = "warn" ]; then
+            DISPLAY_DECISION="Flagged"
+          else
+            DISPLAY_DECISION="Clear"
+          fi
+
           echo ""
           echo "════════════════════════════════════════════"
           echo "  Cloak Compliance Scan Result"
           echo ""
-          echo "  Scanner decision  : ${DECISION}"
-          echo "  Outcome           : ${OUTCOME}"
-          [ -n "${BLOCKING_REASONS}" ] && echo "  Blocking          : ${BLOCKING_REASONS}"
-          echo ""
+          echo "  Result            : ${DISPLAY_DECISION}"
           if [ "${AGENT_AVAILABLE}" = "true" ]; then
             echo "  Compliance posture: ${NOT_READY} Must Fix · ${AT_RISK} Needs Attention · ${READY} Audit Ready"
           fi
           if [ "${CONFLICT_COUNT}" != "0" ] && [ -n "${CONFLICT_CONTROLS}" ]; then
-            echo ""
-            echo "  Scanner and agent disagree on: ${CONFLICT_CONTROLS}"
-            echo "  Open the dashboard to review and resolve before your next audit."
+            echo "  Conflicts         : ${CONFLICT_CONTROLS}"
+          fi
+          if [ -n "${BLOCKING_REASONS}" ]; then
+            echo "  Issues            : ${BLOCKING_REASONS}"
           fi
           echo ""
           echo "  Dashboard: https://app.getcloakai.com/scan/${RUN_ID}"
@@ -211,18 +218,16 @@ jobs:
           echo "outcome=${OUTCOME}"   >> $GITHUB_OUTPUT
 
           if [ "$DECISION" = "block" ]; then
-            echo "::error::Cloak blocked this scan. ${BLOCKING_REASONS}. Dashboard: https://app.getcloakai.com/scan/${RUN_ID}"
+            echo "::warning::Cloak flagged compliance issues: ${BLOCKING_REASONS}. Review at https://app.getcloakai.com/scan/${RUN_ID}"
             if [ "${CLOAK_BLOCK_ON_FAIL}" = "true" ]; then
               exit 1
-            else
-              echo "Set CLOAK_BLOCK_ON_FAIL=true to enforce blocking."
             fi
           elif [ "$DECISION" = "warn" ]; then
             if [ "${CONFLICT_COUNT}" != "0" ] && [ -n "${CONFLICT_CONTROLS}" ]; then
-              echo "::warning::Cloak: scanner and agent disagree on ${CONFLICT_CONTROLS}. Review in dashboard: https://app.getcloakai.com/scan/${RUN_ID}"
+              echo "::warning::Cloak: scanner and agent disagree on ${CONFLICT_CONTROLS}. Review at https://app.getcloakai.com/scan/${RUN_ID}"
             else
-              echo "::warning::Cloak warnings. Dashboard: https://app.getcloakai.com/scan/${RUN_ID}"
+              echo "::warning::Cloak flagged items for review. Dashboard: https://app.getcloakai.com/scan/${RUN_ID}"
             fi
           else
-            echo "Cloak scan passed."
+            echo "Cloak: no compliance issues found."
           fi
